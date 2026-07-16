@@ -1,8 +1,14 @@
-"""vonnegut: full-screen TUI prose editor with a scope-aware AI agent.
+"""vonnegut: full-screen TUI prose editor with a scope-laddering AI agent.
 
-The whole screen is prose. Ctrl+G opens an agent panel at the cursor. Pick a
-scope — Document, Selection, or Line — type a request, and the agent's revision
-replaces exactly that range in place.
+The whole screen is prose.
+  Ctrl+D          grow the edit scope: cursor → word → sentence → paragraph
+                  → section → document (clamps at document). The scope is
+                  highlighted and the cursor locks while a scope is active.
+  Ctrl+Shift+D    shrink the scope one rung (back to cursor unlocks).
+  Ctrl+G          open the instruction box for the current scope (or the whole
+                  document if none). Type + Enter → the agent's revision streams
+                  in place over that range. Collapses to cursor when done.
+  Esc             cancel: close the box and collapse to cursor.
 """
 
 from __future__ import annotations
@@ -14,22 +20,14 @@ from pathlib import Path
 from pydantic_ai import Agent
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import (
-    Footer,
-    Header,
-    Input,
-    RadioButton,
-    RadioSet,
-    Tab,
-    Tabs,
-    TextArea,
-)
+from textual.widgets import Footer, Header, Input, Static, Tab, Tabs, TextArea
 from textual.widgets.text_area import Selection
 
 MODEL = os.environ.get("VONNEGUT_MODEL", "openai:gpt-4o")
 THEMES = ["monokai", "dracula", "vscode_dark", "github_light", "css"]
-SCOPES = ["Document", "Selection", "Line"]
+LEVELS = ["Word", "Sentence", "Paragraph", "Section", "Document"]
 
 EDIT_SYSTEM = (
     "You are Vonnegut, a prose-editing assistant. Each request gives you the full "
@@ -48,6 +46,24 @@ def _resolve(workdir: Path, name: str) -> Path:
     return p
 
 
+def _loc_to_offset(text: str, loc) -> int:
+    row, col = loc
+    lines = text.split("\n")
+    return sum(len(l) + 1 for l in lines[:row]) + col
+
+
+def _offset_to_loc(text: str, off: int):
+    off = max(0, min(off, len(text)))
+    lines = text.split("\n")
+    row = 0
+    for line in lines:
+        if off <= len(line):
+            return (row, off)
+        off -= len(line) + 1
+        row += 1
+    return (len(lines) - 1, len(lines[-1]))
+
+
 def _advance(start, text: str):
     """End Location after inserting `text` at `start`."""
     lines = text.split("\n")
@@ -56,18 +72,96 @@ def _advance(start, text: str):
     return (start[0] + len(lines) - 1, len(lines[-1]))
 
 
-def _scope_range(editor: TextArea, scope: str):
-    """Return the (start, end) Locations the scope covers."""
-    doc = editor.document
-    if scope == "Document":
-        last = doc.line_count - 1
-        return (0, 0), (last, len(doc.get_line(last)))
-    if scope == "Selection" and not editor.selection.is_empty:
-        s, e = editor.selection.start, editor.selection.end
-        return min(s, e), max(s, e)  # Locations are (row, col) tuples
-    # Line — also the fallback when "Selection" is empty.
-    row = editor.cursor_location[0]
-    return (row, 0), (row, len(doc.get_line(row)))
+# --- scope ladder ------------------------------------------------------------
+
+def _is_word(c: str) -> bool:
+    return c.isalnum() or c in "'-_"
+
+
+def _word_range(text: str, off: int):
+    n = len(text)
+    if n == 0:
+        return 0, 0
+    p = min(off, n - 1)
+    if not _is_word(text[p]):  # snap onto the nearest word char
+        if off > 0 and _is_word(text[off - 1]):
+            p = off - 1
+        else:
+            q = off
+            while q < n and not _is_word(text[q]):
+                q += 1
+            p = q if q < n else max(0, off - 1)
+    s = e = min(p, n)
+    while s > 0 and _is_word(text[s - 1]):
+        s -= 1
+    while e < n and _is_word(text[e]):
+        e += 1
+    return s, e
+
+
+def _paragraph_range(text: str, off: int):
+    n = len(text)
+    s = text.rfind("\n\n", 0, off)
+    s = 0 if s < 0 else s + 2
+    e = text.find("\n\n", off)
+    return s, (n if e < 0 else e)
+
+
+def _sentence_range(text: str, off: int):
+    ps, pe = _paragraph_range(text, off)  # sentences never cross paragraphs
+    s = ps
+    for i in range(min(off, pe) - 1, ps - 1, -1):
+        if text[i] in ".!?":
+            s = i + 1
+            break
+    while s < pe and text[s] in " \t\n":
+        s += 1
+    e = pe
+    for i in range(max(off, s), pe):
+        if text[i] in ".!?":
+            e = i + 1
+            break
+    return s, max(s, e)
+
+
+def _heading_level(line: str) -> int:
+    st = line.lstrip()
+    return len(st) - len(st.lstrip("#")) if st.startswith("#") else 0
+
+
+def _section_range(text: str, off: int):
+    lines = text.split("\n")
+    starts, acc = [], 0
+    for l in lines:
+        starts.append(acc)
+        acc += len(l) + 1
+    row = _offset_to_loc(text, off)[0]
+    h, hl = None, 0
+    for i in range(row, -1, -1):
+        lv = _heading_level(lines[i])
+        if lv:
+            h, hl = i, lv
+            break
+    start = starts[h] if h is not None else 0
+    start_row = h if h is not None else 0
+    end = len(text)
+    for i in range(start_row + 1, len(lines)):
+        lv = _heading_level(lines[i])
+        if lv and hl and lv <= hl:
+            end = starts[i] - 1  # stop before the newline preceding the next heading
+            break
+    return start, max(start, end)
+
+
+def _level_range(text: str, off: int, level: str):
+    if level == "Document":
+        return 0, len(text)
+    return {
+        "Word": _word_range,
+        "Sentence": _sentence_range,
+        "Paragraph": _paragraph_range,
+        "Section": _section_range,
+    }[level](text, off)
 
 
 class Vonnegut(App):
@@ -80,17 +174,19 @@ class Vonnegut(App):
         display: none;
         width: 62;
         height: auto;
-        max-height: 20;
+        max-height: 8;
         padding: 0 1;
         background: $panel;
         border: round $accent;
     }
     #agentpanel.-visible { display: block; }
-    #scope { height: auto; layout: horizontal; }
+    #target { height: 1; color: $text-muted; }
     """
     BINDINGS = [
-        ("ctrl+g", "ask", "Ask agent"),
-        ("escape", "close_panel", "Close panel"),
+        Binding("ctrl+g", "ask", "Ask agent", priority=True),
+        Binding("ctrl+d", "grow", "Grow scope", priority=True),
+        Binding("ctrl+shift+d", "shrink", "Shrink scope", priority=True),
+        ("escape", "cancel", "Cancel"),
         ("ctrl+s", "save", "Save"),
         ("ctrl+t", "theme", "Theme"),
         ("ctrl+q", "quit", "Quit"),
@@ -103,6 +199,10 @@ class Vonnegut(App):
         self.editor_theme = theme_name
         others = [p for p in sorted(workdir.glob("*.md")) if p != self.file]
         self.tabmap = {f"f{i}": p for i, p in enumerate([self.file, *others])}
+        self.level = -1  # -1 = no scope (cursor); else index into LEVELS
+        self.anchor = 0  # char offset the ladder expands around
+        self.sel: tuple[int, int] | None = None  # active scope range (offsets)
+        self.edit_range: tuple[int, int] = (0, 0)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -112,10 +212,7 @@ class Vonnegut(App):
             text, language="markdown", theme=self.editor_theme, id="editor"
         )
         with Vertical(id="agentpanel"):
-            with RadioSet(id="scope"):
-                yield RadioButton("Document")
-                yield RadioButton("Selection")
-                yield RadioButton("Line", value=True)
+            yield Static(id="target")
             yield Input(placeholder="Instruction…", id="ask")
         yield Footer()
 
@@ -124,10 +221,14 @@ class Vonnegut(App):
         self.sub_title = self.file.name
         self.query_one("#editor", TextArea).focus()
 
+    @property
+    def editor(self) -> TextArea:
+        return self.query_one("#editor", TextArea)
+
     # --- files / tabs ---
 
     def action_save(self) -> None:
-        self.file.write_text(self.query_one("#editor", TextArea).text)
+        self.file.write_text(self.editor.text)
         self.notify(f"saved {self.file.name}")
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
@@ -137,69 +238,119 @@ class Vonnegut(App):
         if target is None or target == self.file:
             return
         try:
-            editor = self.query_one("#editor", TextArea)
+            editor = self.editor
         except Exception:
             return  # fired before the editor mounted
         self.file.write_text(editor.text)  # auto-save on switch
         self.file = target
         editor.load_text(target.read_text() if target.exists() else "")
+        self._collapse()
         self.sub_title = target.name
 
     def action_theme(self) -> None:
-        editor = self.query_one("#editor", TextArea)
+        editor = self.editor
         i = THEMES.index(editor.theme) + 1 if editor.theme in THEMES else 0
         editor.theme = THEMES[i % len(THEMES)]
         self.notify(f"theme: {editor.theme}")
 
-    # --- agent panel (follows the cursor, scoped edits) ---
+    # --- scope ladder ---
+
+    def action_grow(self) -> None:
+        if self.level < 0:  # engage: anchor at the current cursor
+            self.anchor = _loc_to_offset(self.editor.text, self.editor.cursor_location)
+            self.level = 0
+        else:
+            self.level = min(self.level + 1, len(LEVELS) - 1)
+        self._apply_scope()
+
+    def action_shrink(self) -> None:
+        if self.level <= 0:
+            self._collapse()
+        else:
+            self.level -= 1
+            self._apply_scope()
+
+    def _apply_scope(self) -> None:
+        editor = self.editor
+        s, e = _level_range(editor.text, self.anchor, LEVELS[self.level])
+        self.sel = (s, e)
+        editor.selection = Selection(
+            _offset_to_loc(editor.text, s), _offset_to_loc(editor.text, e)
+        )
+        self.set_focus(None)  # lock the cursor while a scope is active
+        self.sub_title = f"{self.file.name} — {LEVELS[self.level]} ({e - s})"
+
+    def _collapse(self) -> None:
+        editor = self.editor
+        self.level, self.sel = -1, None
+        cur = _offset_to_loc(editor.text, self.anchor)
+        editor.selection = Selection(cur, cur)
+        editor.focus()  # unlock
+        self.sub_title = self.file.name
+
+    # --- agent panel ---
 
     def action_ask(self) -> None:
-        editor = self.query_one("#editor", TextArea)
+        editor = self.editor
+        if self.sel is not None:
+            s, e = self.sel
+            label = f"{LEVELS[self.level]} · {e - s} chars"
+        else:
+            s, e = 0, len(editor.text)
+            label = f"whole document · {e} chars"
+        self.edit_range = (s, e)
         panel = self.query_one("#agentpanel")
         off = editor.cursor_screen_offset
-        x = min(off.x, max(0, self.size.width - 62))
-        y = min(off.y + 1, max(0, self.size.height - 20))
-        panel.styles.offset = (x, y)
+        panel.styles.offset = (
+            min(off.x, max(0, self.size.width - 62)),
+            min(off.y + 1, max(0, self.size.height - 8)),
+        )
+        self.query_one("#target", Static).update(f"editing: {label}")
         panel.add_class("-visible")
-        # Default the scope to Selection if there's a highlight, else Line.
-        buttons = list(self.query_one("#scope", RadioSet).query(RadioButton))
-        buttons[1 if not editor.selection.is_empty else 2].value = True
         self.query_one("#ask", Input).focus()
 
-    def action_close_panel(self) -> None:
+    def action_cancel(self) -> None:
         self.query_one("#agentpanel").remove_class("-visible")
-        self.query_one("#editor", TextArea).focus()
+        if self.level >= 0:
+            self._collapse()
+        else:
+            self.editor.focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
             return
         event.input.value = ""
-        idx = self.query_one("#scope", RadioSet).pressed_index
-        self.action_close_panel()  # close dialog immediately
-        self.edit_scope(prompt, SCOPES[idx if idx >= 0 else 2])
+        self.query_one("#agentpanel").remove_class("-visible")
+        self.run_edit(prompt, *self.edit_range)
 
     @work(exclusive=True)
-    async def edit_scope(self, prompt: str, scope: str) -> None:
-        editor = self.query_one("#editor", TextArea)
-        start, end = _scope_range(editor, scope)
+    async def run_edit(self, prompt: str, s_off: int, e_off: int) -> None:
+        editor = self.editor
+        text = editor.text
+        start = _offset_to_loc(text, s_off)
+        end = _offset_to_loc(text, e_off)
         target = editor.get_text_range(start, end)
         context = (
-            f"<document>\n{editor.text}\n</document>\n\n"
-            f"<target scope={scope.lower()!r}>\n{target}\n</target>\n\n"
-            f"Request: {prompt}"
+            f"<document>\n{text}\n</document>\n\n"
+            f"<target>\n{target}\n</target>\n\nRequest: {prompt}"
         )
         cur_end = end
         try:
             async with agent.run_stream(context) as result:
                 # Cumulative text: rewrite the range in place and highlight it live.
-                async for text in result.stream_text(debounce_by=0.1):
-                    editor.replace(text, start, cur_end, maintain_selection_offset=False)
-                    cur_end = _advance(start, text)
+                async for chunk in result.stream_text(debounce_by=0.1):
+                    editor.replace(chunk, start, cur_end, maintain_selection_offset=False)
+                    cur_end = _advance(start, chunk)
                     last_line = editor.document.get_line(cur_end[0])
                     editor.selection = Selection((start[0], 0), (cur_end[0], len(last_line)))
         except Exception as exc:  # surface API/config errors instead of dying silently
             self.notify(f"agent error: {exc}", severity="error")
+            self._collapse()
+            return
+        # Collapse to cursor at the end of the new text.
+        self.anchor = _loc_to_offset(editor.text, cur_end)
+        self._collapse()
 
 
 def main() -> None:
