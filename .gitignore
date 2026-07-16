@@ -20,3 +20,9 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+# demo build artifacts
+draft.md
+demo.cast
+demo_trim.cast
+driver.sh

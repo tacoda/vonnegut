@@ -4,6 +4,8 @@ Full-screen terminal prose editor with a scope-laddering AI agent. The whole
 screen is your markdown. Grow a scope around the cursor, then have the agent
 rewrite exactly that span — its revision streams in place.
 
+![vonnegut demo](demo.gif)
+
 ## Run
 
 ```sh
