@@ -4,11 +4,14 @@ The whole screen is prose.
   Ctrl+D          grow the edit scope: cursor → word → sentence → paragraph
                   → section → document (clamps at document). The scope is
                   highlighted and the cursor locks while a scope is active.
-  Ctrl+Shift+D    shrink the scope one rung (back to cursor unlocks).
+  Ctrl+E          shrink the scope one rung (back to cursor unlocks).
   Ctrl+G          open the instruction box for the current scope (or the whole
                   document if none). Type + Enter → the agent's revision streams
-                  in place over that range. Collapses to cursor when done.
-  Esc             cancel: close the box and collapse to cursor.
+                  in place over that range. ↑/↓ recall past instructions.
+                  When it lands the edit is PENDING: Enter accepts, Esc reverts.
+  Ctrl+R          retry: rerun the last instruction on the same original span.
+  Ctrl+Z          undo the last accepted agent edit in one step.
+  Esc             cancel: reject a pending edit / close the box / collapse.
 """
 
 from __future__ import annotations
@@ -185,7 +188,10 @@ class Vonnegut(App):
     BINDINGS = [
         Binding("ctrl+g", "ask", "Ask agent", priority=True),
         Binding("ctrl+d", "grow", "Grow scope", priority=True),
-        Binding("ctrl+shift+d", "shrink", "Shrink scope", priority=True),
+        Binding("ctrl+e", "shrink", "Shrink scope", priority=True),
+        Binding("ctrl+r", "retry", "Retry edit", priority=True),
+        Binding("ctrl+z", "undo_edit", "Undo edit", priority=True),
+        Binding("enter", "accept_edit", "Accept", show=False),
         ("escape", "cancel", "Cancel"),
         ("ctrl+s", "save", "Save"),
         ("ctrl+t", "theme", "Theme"),
@@ -203,6 +209,12 @@ class Vonnegut(App):
         self.anchor = 0  # char offset the ladder expands around
         self.sel: tuple[int, int] | None = None  # active scope range (offsets)
         self.edit_range: tuple[int, int] = (0, 0)
+        self.pending = False  # a streamed edit is awaiting accept/reject
+        self.snapshot: str | None = None  # full doc before the last agent edit
+        self.snap_cursor = 0  # cursor offset to restore alongside snapshot
+        self.last_edit: tuple[str, int, int] | None = None  # (prompt, s, e) for retry
+        self.history: list[str] = []  # past instructions, oldest first
+        self.hist_idx = 0  # cursor into history (== len == "new/blank")
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -306,21 +318,88 @@ class Vonnegut(App):
             min(off.y + 1, max(0, self.size.height - 8)),
         )
         self.query_one("#target", Static).update(f"editing: {label}")
+        self.hist_idx = len(self.history)  # ↑ starts from the newest instruction
         panel.add_class("-visible")
         self.query_one("#ask", Input).focus()
 
     def action_cancel(self) -> None:
+        if self.pending:  # reject the streamed edit, restore the original text
+            self._restore_snapshot()
+            self.notify("reverted")
+            return
         self.query_one("#agentpanel").remove_class("-visible")
         if self.level >= 0:
             self._collapse()
         else:
             self.editor.focus()
 
+    def action_accept_edit(self) -> None:
+        if not self.pending:
+            return
+        self.pending = False  # keep the text; snapshot stays for a later Ctrl+Z
+        self._collapse()
+        self.notify("accepted · Ctrl+Z to undo")
+
+    def action_undo_edit(self) -> None:
+        if self.snapshot is not None:  # one-step undo of the last agent edit
+            self._restore_snapshot()
+            self.notify("edit undone")
+        else:  # no agent edit outstanding: fall back to the editor's own undo
+            self.editor.undo()
+
+    def action_retry(self) -> None:
+        if self.last_edit is None:
+            self.notify("nothing to retry")
+            return
+        if self.snapshot is not None:  # rerun on the original span, not the revision
+            self.editor.load_text(self.snapshot)
+        prompt, s, e = self.last_edit
+        self.run_edit(prompt, s, e)
+
+    def _restore_snapshot(self) -> None:
+        editor = self.editor
+        if self.snapshot is not None:
+            editor.load_text(self.snapshot)
+        self.snapshot = None
+        self.pending = False
+        self.anchor = self.snap_cursor
+        self._collapse()
+
+    def _stales_snapshot(self, event) -> bool:
+        # Manual typing after an accepted edit stales the snapshot.
+        if self.pending or self.snapshot is None:
+            return False
+        if self.focused is not self.editor:
+            return False
+        return event.character is not None or event.key in ("backspace", "delete")
+
+    def _navigate_history(self, event) -> None:
+        if event.key == "up" and self.hist_idx > 0:
+            self.hist_idx -= 1
+        elif event.key == "down" and self.hist_idx < len(self.history):
+            self.hist_idx += 1
+        else:
+            return
+        val = self.history[self.hist_idx] if self.hist_idx < len(self.history) else ""
+        self.query_one("#ask", Input).value = val
+        event.stop()
+
+    def on_key(self, event) -> None:
+        # Drop a stale snapshot so Ctrl+Z reverts to the editor's own history,
+        # not the pre-agent state.
+        if self._stales_snapshot(event):
+            self.snapshot = None
+        if self.focused is self.query_one("#ask", Input):
+            self._navigate_history(event)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
             return
         event.input.value = ""
+        if not self.history or self.history[-1] != prompt:
+            self.history.append(prompt)
+        self.hist_idx = len(self.history)
         self.query_one("#agentpanel").remove_class("-visible")
         self.run_edit(prompt, *self.edit_range)
 
@@ -328,6 +407,9 @@ class Vonnegut(App):
     async def run_edit(self, prompt: str, s_off: int, e_off: int) -> None:
         editor = self.editor
         text = editor.text
+        self.snapshot = text  # full doc before the edit → accept/reject/undo pivot
+        self.snap_cursor = s_off
+        self.last_edit = (prompt, s_off, e_off)
         start = _offset_to_loc(text, s_off)
         end = _offset_to_loc(text, e_off)
         target = editor.get_text_range(start, end)
@@ -346,11 +428,13 @@ class Vonnegut(App):
                     editor.selection = Selection((start[0], 0), (cur_end[0], len(last_line)))
         except Exception as exc:  # surface API/config errors instead of dying silently
             self.notify(f"agent error: {exc}", severity="error")
-            self._collapse()
+            self._restore_snapshot()
             return
-        # Collapse to cursor at the end of the new text.
+        # The revision is in place but PENDING: Enter accepts, Esc/Ctrl+Z reverts.
+        self.pending = True
         self.anchor = _loc_to_offset(editor.text, cur_end)
-        self._collapse()
+        self.set_focus(None)  # keep the cursor locked so accept/reject keys reach us
+        self.sub_title = f"{self.file.name} — pending · Enter accept · Esc revert"
 
 
 def main() -> None:
